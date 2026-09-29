@@ -13,7 +13,7 @@
 
 ## Установка и требования
 
-- PHP **^8.4** (см. `composer.json`)
+- PHP **^8.5** (см. `composer.json`)
 - Установите пакет: `composer require phpsoftbox/cache`
 - Опциональные расширения/сервисы для драйверов: `ext-redis`, `ext-memcached`, `ext-pdo` (доступ к БД для PDO).
 

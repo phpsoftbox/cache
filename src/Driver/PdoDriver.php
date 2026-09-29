@@ -128,21 +128,21 @@ final class PdoDriver implements DriverInterface, PrunableDriverInterface
             PdoDriverEnum::PGSQL => "
                 INSERT INTO {$table} ({$keyCol}, {$valCol}, {$expCol}, {$createdCol})
                 VALUES (:key, :value, :expiration_datetime, :created_datetime)
-                ON CONFLICT ({$keyCol}) DO UPDATE SET
+                ON CONFLICT ({$keyCol}) DO UPDATE
+                SET
                     {$valCol} = EXCLUDED.{$this->qiRaw($this->schema->valueColumn)},
                     {$expCol} = EXCLUDED.{$this->qiRaw($this->schema->expirationDatetimeColumn)}
             ",
             PdoDriverEnum::MYSQL => "
                 INSERT INTO {$table} ({$keyCol}, {$valCol}, {$expCol}, {$createdCol})
                 VALUES (:key, :value, :expiration_datetime, :created_datetime)
-                ON DUPLICATE KEY UPDATE
-                    {$valCol} = VALUES({$valCol}),
-                    {$expCol} = VALUES({$expCol})
+                ON DUPLICATE KEY UPDATE {$valCol} = VALUES({$valCol}), {$expCol} = VALUES({$expCol})
             ",
             PdoDriverEnum::SQLITE => "
                 INSERT INTO {$table} ({$keyCol}, {$valCol}, {$expCol}, {$createdCol})
                 VALUES (:key, :value, :expiration_datetime, :created_datetime)
-                ON CONFLICT({$keyCol}) DO UPDATE SET
+                ON CONFLICT({$keyCol}) DO UPDATE
+                SET
                     {$valCol} = excluded.{$this->qiRaw($this->schema->valueColumn)},
                     {$expCol} = excluded.{$this->qiRaw($this->schema->expirationDatetimeColumn)}
             ",
