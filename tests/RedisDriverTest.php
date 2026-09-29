@@ -12,10 +12,16 @@ use Redis;
 use Throwable;
 
 use function extension_loaded;
+use function gethostbyname;
 
 #[CoversClass(RedisDriver::class)]
 final class RedisDriverTest extends TestCase
 {
+    /**
+     * Стандартный контейнерный хост из docker-compose.
+     */
+    private const string REDIS_HOST = 'redis';
+
     /**
      * Проверяет базовый set/get на Redis.
      */
@@ -26,12 +32,16 @@ final class RedisDriverTest extends TestCase
             self::markTestSkipped('ext-redis is not installed.');
         }
 
+        // В тестовой среде может не быть redis сервиса. Тогда пропускаем.
+        // Имя хоста проверяем заранее: при неразрешимом имени connect() выдаёт PHP warning до исключения.
+        if (gethostbyname(self::REDIS_HOST) === self::REDIS_HOST) {
+            self::markTestSkipped('Redis server is not available.');
+        }
+
         $redis = new Redis();
 
-        // В тестовой среде может не быть redis сервиса. Тогда пропускаем.
         try {
-            // стандартный контейнерный хост из docker-compose
-            $redis->connect('redis', 6379, 1.0);
+            $redis->connect(self::REDIS_HOST, 6379, 1.0);
         } catch (Throwable) {
             self::markTestSkipped('Redis server is not available.');
         }
