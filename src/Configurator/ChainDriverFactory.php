@@ -9,25 +9,32 @@ use PhpSoftBox\Cache\Contracts\DriverInterface;
 use PhpSoftBox\Cache\Driver\ChainDriver;
 
 use function is_array;
+use function is_int;
 use function is_string;
 
 /**
  * Создаёт chain-драйвер.
  *
- * Ожидаемый формат options:
+ * Формат options:
  *
- * - stores: non-empty-list<string> (имена driver для вложенных уровней)
+ * - drivers: непустой список уровней (L1, L2, ...). Уровень — имя драйвера (`'array'`) или массив
+ *   `['driver' => 'file', 'options' => [...]]` с опциями вложенного драйвера
+ * - warmup_ttl: TTL прогрева верхних уровней, если нижний уровень не сообщает оставшийся срок записи
+ *   (по умолчанию ChainDriver::DEFAULT_WARMUP_TTL)
  *
  * Пример:
  *
  * options: [
- *   'stores' => ['array', 'file']
+ *   'drivers' => [
+ *     'array',
+ *     ['driver' => 'file', 'options' => ['directory' => '/var/cache/app']],
+ *   ],
  * ]
  */
 final readonly class ChainDriverFactory implements DriverFactoryInterface
 {
     /**
-     * @param list<DriverFactoryInterface> $driverFactories
+     * @param list<DriverFactoryInterface> $driverFactories фабрики вложенных драйверов
      */
     public function __construct(
         private array $driverFactories,
@@ -41,36 +48,56 @@ final readonly class ChainDriverFactory implements DriverFactoryInterface
 
     public function create(CacheConfig $config): DriverInterface
     {
-        /** @var mixed $stores */
-        $stores = $config->options['stores'] ?? null;
-        if (!is_array($stores) || $stores === []) {
-            throw new InvalidArgumentException('Chain driver требует options[stores] (non-empty list).');
+        $levels = $config->options['drivers'] ?? null;
+        if (!is_array($levels) || $levels === []) {
+            throw new InvalidArgumentException('Chain driver requires options[drivers] (non-empty list).');
         }
 
         $drivers = [];
-        foreach ($stores as $storeDriverName) {
-            if (!is_string($storeDriverName) || $storeDriverName === '') {
-                throw new InvalidArgumentException('Chain driver options[stores] должен быть списком строк.');
-            }
-
-            $drivers[] = $this->createByName($storeDriverName);
+        foreach ($levels as $level) {
+            $drivers[] = $this->createLevel($this->levelConfig($level));
         }
 
-        if ($drivers === []) {
-            throw new InvalidArgumentException('Chain driver требует хотя бы один драйвер в options[stores].');
+        $warmupTtl = $config->options['warmup_ttl'] ?? ChainDriver::DEFAULT_WARMUP_TTL;
+        if (!is_int($warmupTtl)) {
+            throw new InvalidArgumentException('Chain driver options[warmup_ttl] must be an integer.');
         }
 
-        return new ChainDriver($drivers);
+        return new ChainDriver($drivers, $warmupTtl);
     }
 
-    private function createByName(string $driver): DriverInterface
+    private function levelConfig(mixed $level): CacheConfig
     {
+        if (is_string($level) && $level !== '') {
+            return new CacheConfig(driver: $level);
+        }
+
+        if (is_array($level) && is_string($level['driver'] ?? null) && $level['driver'] !== '') {
+            $options = $level['options'] ?? [];
+            if (!is_array($options)) {
+                throw new InvalidArgumentException('Chain driver level options must be an array.');
+            }
+
+            return new CacheConfig(driver: $level['driver'], options: $options);
+        }
+
+        throw new InvalidArgumentException(
+            'Chain driver options[drivers] items must be a driver name or an array with "driver" and optional "options".',
+        );
+    }
+
+    private function createLevel(CacheConfig $config): DriverInterface
+    {
+        if ($config->driver === 'chain') {
+            throw new InvalidArgumentException('Chain driver cannot contain another chain.');
+        }
+
         foreach ($this->driverFactories as $factory) {
-            if ($factory->supports($driver)) {
-                return $factory->create(new CacheConfig(driver: $driver));
+            if ($factory->supports($config->driver)) {
+                return $factory->create($config);
             }
         }
 
-        throw new InvalidArgumentException('Unknown cache driver in chain: ' . $driver);
+        throw new InvalidArgumentException('Unknown cache driver in chain: ' . $config->driver);
     }
 }

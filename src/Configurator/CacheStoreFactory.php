@@ -11,12 +11,18 @@ use PhpSoftBox\Cache\Psr16\SimpleCache;
 use PhpSoftBox\Cache\Psr6\CacheItemPool;
 
 /**
- * Фабрика "store" объектов Cache (и соответствующих PSR адаптеров/пулов).
+ * Фабрика "store" объектов Cache.
  *
+ * Драйвер создаётся один раз на store: PSR-16 и PSR-6 одного стора видят одни и те же данные.
  * В DI-варианте этот класс собирается контейнером.
  */
 final class CacheStoreFactory implements CacheStoreFactoryInterface
 {
+    /**
+     * @var array<string, CacheStore>
+     */
+    private array $instances = [];
+
     /**
      * @param array<string, CacheConfig> $stores
      * @param list<DriverFactoryInterface> $driverFactories
@@ -27,35 +33,26 @@ final class CacheStoreFactory implements CacheStoreFactoryInterface
     ) {
     }
 
-    public function pool(string $store = 'default'): CacheItemPool
-    {
-        $config = $this->getConfig($store);
-        $driver = $this->createDriver($config);
-
-        return new CacheItemPool(
-            driver: $driver,
-            namespace: $config->namespace,
-            defaultTtl: $config->defaultTtl,
-        );
-    }
-
-    public function simple(string $store = 'default'): SimpleCache
-    {
-        $config = $this->getConfig($store);
-        $driver = $this->createDriver($config);
-
-        return new SimpleCache(
-            driver: $driver,
-            namespace: $config->namespace,
-            defaultTtl: $config->defaultTtl,
-        );
-    }
-
     public function store(string $store = 'default'): CacheStore
     {
-        return new CacheStore(
-            simple: $this->simple($store),
-            pool: $this->pool($store),
+        if (isset($this->instances[$store])) {
+            return $this->instances[$store];
+        }
+
+        $config = $this->getConfig($store);
+        $driver = $this->createDriver($config);
+
+        return $this->instances[$store] = new CacheStore(
+            simple: new SimpleCache(
+                driver: $driver,
+                namespace: $config->namespace,
+                defaultTtl: $config->defaultTtl,
+            ),
+            pool: new CacheItemPool(
+                driver: $driver,
+                namespace: $config->namespace,
+                defaultTtl: $config->defaultTtl,
+            ),
         );
     }
 

@@ -8,6 +8,9 @@ use PhpSoftBox\Cache\Cache;
 
 /**
  * Сборка компонента Cache из массива конфигурации (для использования без DI).
+ *
+ * Встроенные драйверы: `array`, `file` и `chain` (уровни chain — встроенные и переданные драйверы).
+ * Остальные драйверы (redis, memcached, pdo) подключаются через $driverFactories.
  */
 final class CacheBuilder
 {
@@ -16,16 +19,20 @@ final class CacheBuilder
      *   default?: string,
      *   stores?: array<string, array{driver?: string, namespace?: string, default_ttl?: mixed, options?: array<string, mixed>}>
      * } $config
+     * @param list<DriverFactoryInterface> $driverFactories дополнительные фабрики драйверов
      */
-    public static function fromConfig(array $config): Cache
+    public static function fromConfig(array $config, array $driverFactories = []): Cache
     {
-        $factory      = self::storeFactoryFromConfig($config);
+        $factory      = self::storeFactoryFromConfig($config, $driverFactories);
         $defaultStore = (string) ($config['default'] ?? 'default');
 
         return new Cache(storeFactory: $factory, defaultStore: $defaultStore);
     }
 
-    public static function storeFactoryFromConfig(array $config): CacheStoreFactory
+    /**
+     * @param list<DriverFactoryInterface> $driverFactories дополнительные фабрики драйверов
+     */
+    public static function storeFactoryFromConfig(array $config, array $driverFactories = []): CacheStoreFactory
     {
         /** @var array<string, array<string, mixed>> $storesConfig */
         $storesConfig = $config['stores'] ?? [];
@@ -44,9 +51,12 @@ final class CacheBuilder
             $stores['default'] = new CacheConfig(driver: 'array');
         }
 
+        $factories   = [...$driverFactories, new BuiltInDriverFactory()];
+        $factories[] = new ChainDriverFactory($factories);
+
         return new CacheStoreFactory(
             stores: $stores,
-            driverFactories: [new BuiltInDriverFactory()],
+            driverFactories: $factories,
         );
     }
 }

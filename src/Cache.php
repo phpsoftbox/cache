@@ -9,6 +9,7 @@ use PhpSoftBox\Cache\Configurator\CacheStoreFactoryInterface;
 use PhpSoftBox\Cache\Contracts\CacheServiceInterface;
 use PhpSoftBox\Cache\Psr16\SimpleCache;
 use PhpSoftBox\Cache\Psr6\CacheItemPool;
+use PhpSoftBox\Cache\Support\CacheKey;
 use PhpSoftBox\Cache\Support\CachePruneOptions;
 use PhpSoftBox\Cache\Support\CachePruneResult;
 
@@ -18,19 +19,19 @@ use PhpSoftBox\Cache\Support\CachePruneResult;
 final class Cache implements CacheServiceInterface
 {
     /**
-     * @var array<string, CacheStore>
+     * Контекстный namespace по имени стора (например, текущий арендатор).
+     *
+     * @var array<string, string>
+     */
+    private array $contextNamespaces = [];
+
+    /**
+     * Сторы по имени и контекстному namespace: повторный вызов store()/pool() отдаёт тот же объект
+     * (важно для отложенных записей PSR-6).
+     *
+     * @var array<string, array<string, CacheStore>>
      */
     private array $stores = [];
-
-    /**
-     * @var array<string, CacheItemPool>
-     */
-    private array $pools = [];
-
-    /**
-     * @var array<string, SimpleCache>
-     */
-    private array $simples = [];
 
     public function __construct(
         private readonly CacheStoreFactoryInterface $storeFactory,
@@ -38,36 +39,64 @@ final class Cache implements CacheServiceInterface
     ) {
     }
 
+    /**
+     * Store по имени с учётом контекстного namespace.
+     *
+     * Не сохраняйте результат надолго: после смены контекстного namespace store нужно запросить заново.
+     */
     public function store(?string $store = null): CacheStore
     {
         $store ??= $this->defaultStore;
 
-        return $this->stores[$store] ??= $this->storeFactory->store($store);
+        $context = $this->contextNamespaces[$store] ?? '';
+
+        if (!isset($this->stores[$store][$context])) {
+            $base = $this->storeFactory->store($store);
+
+            $this->stores[$store][$context] = $context === '' ? $base : $base->withNamespace($context);
+        }
+
+        return $this->stores[$store][$context];
     }
 
     /**
-     * Низкоуровневый доступ к PSR-6 pool (например для сторонних библиотек).
+     * Низкоуровневый доступ к PSR-6 pool стора (например для сторонних библиотек).
      */
     public function pool(?string $store = null): CacheItemPool
     {
-        $store ??= $this->defaultStore;
-
-        return $this->pools[$store] ??= $this->storeFactory->pool($store);
+        return $this->store($store)->psr6();
     }
 
     /**
-     * Низкоуровневый доступ к PSR-16 cache (например для сторонних библиотек).
+     * Низкоуровневый доступ к PSR-16 cache стора (например для сторонних библиотек).
      */
     public function simple(?string $store = null): SimpleCache
     {
-        $store ??= $this->defaultStore;
-
-        return $this->simples[$store] ??= $this->storeFactory->simple($store);
+        return $this->store($store)->psr16();
     }
 
     public function storeWithNamespace(string $namespace, ?string $store = null): CacheStore
     {
         return $this->store($store)->withNamespace($namespace);
+    }
+
+    public function contextNamespace(?string $store = null): string
+    {
+        return $this->contextNamespaces[$store ?? $this->defaultStore] ?? '';
+    }
+
+    public function setContextNamespace(string $namespace, ?string $store = null): void
+    {
+        CacheKey::assertValidNamespace($namespace);
+
+        $store ??= $this->defaultStore;
+        if ($namespace === '') {
+            unset($this->contextNamespaces[$store]);
+
+            return;
+        }
+
+        $this->contextNamespaces[$store] = $namespace;
     }
 
     public function get(string $key, mixed $default = null): mixed
@@ -87,7 +116,7 @@ final class Cache implements CacheServiceInterface
 
     public function clear(): bool
     {
-        // Важно: clear() очищает весь store (и namespace стора). Feature-namespace тут не учитывается.
+        // очищает namespace стора по умолчанию с учётом контекстного namespace
         return $this->store()->clear();
     }
 

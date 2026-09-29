@@ -6,7 +6,9 @@ namespace PhpSoftBox\Cache\Driver;
 
 use DateInterval;
 use PhpSoftBox\Cache\Contracts\DriverInterface;
+use PhpSoftBox\Cache\Contracts\ExpirationAwareDriverInterface;
 use PhpSoftBox\Cache\Contracts\PrunableDriverInterface;
+use PhpSoftBox\Cache\Support\CacheKey;
 use PhpSoftBox\Cache\Support\CachePruneOptions;
 use PhpSoftBox\Cache\Support\CachePruneResult;
 use PhpSoftBox\Cache\Support\Ttl;
@@ -22,13 +24,14 @@ use function is_array;
 use function is_dir;
 use function is_file;
 use function is_int;
-use function max;
+use function is_string;
 use function mkdir;
 use function random_bytes;
 use function rename;
 use function rtrim;
 use function serialize;
 use function sha1;
+use function str_starts_with;
 use function time;
 use function unlink;
 use function unserialize;
@@ -38,9 +41,10 @@ use const LOCK_EX;
 /**
  * File-based драйвер.
  *
- * Хранит каждый ключ отдельным файлом. Значения сериализуются через PHP serialize.
+ * Хранит каждый ключ отдельным файлом `sha1(key).cache`. В файле — serialize() массива с ключом, моментом
+ * истечения и значением; ключ нужен, чтобы clear() очищал только свой namespace.
  */
-final class FileDriver implements DriverInterface, PrunableDriverInterface
+final class FileDriver implements DriverInterface, PrunableDriverInterface, ExpirationAwareDriverInterface
 {
     public static function isSupported(): bool
     {
@@ -57,33 +61,40 @@ final class FileDriver implements DriverInterface, PrunableDriverInterface
 
     public function fetch(string $key): array
     {
+        $f = $this->fetchWithExpiration($key);
+
+        return ['hit' => $f['hit'], 'value' => $f['value']];
+    }
+
+    public function fetchWithExpiration(string $key): array
+    {
+        $miss = ['hit' => false, 'value' => null, 'expiresAt' => null];
+
         $path = $this->pathForKey($key);
         if (!file_exists($path)) {
-            return ['hit' => false, 'value' => null];
+            return $miss;
         }
 
         $raw = @file_get_contents($path);
         if ($raw === false) {
-            return ['hit' => false, 'value' => null];
+            return $miss;
         }
 
         $payload = @unserialize($raw);
         if (!is_array($payload) || !array_key_exists('expiresAt', $payload) || !array_key_exists('value', $payload)) {
             @unlink($path);
 
-            return ['hit' => false, 'value' => null];
+            return $miss;
         }
 
         $expiresAt = $payload['expiresAt'];
-        if ($expiresAt !== null) {
-            if (!is_int($expiresAt) || $expiresAt < time()) {
-                @unlink($path);
+        if ($expiresAt !== null && (!is_int($expiresAt) || $expiresAt <= time())) {
+            @unlink($path);
 
-                return ['hit' => false, 'value' => null];
-            }
+            return $miss;
         }
 
-        return ['hit' => true, 'value' => $payload['value']];
+        return ['hit' => true, 'value' => $payload['value'], 'expiresAt' => $expiresAt];
     }
 
     public function get(string $key): mixed
@@ -96,14 +107,13 @@ final class FileDriver implements DriverInterface, PrunableDriverInterface
     public function set(string $key, mixed $value, int|DateInterval|null $ttl = null): bool
     {
         $ttlSeconds = Ttl::normalizeSeconds($ttl);
-
-        $expiresAt = null;
-        if ($ttlSeconds !== null) {
-            $expiresAt = time() + max(0, $ttlSeconds);
+        if (Ttl::isExpired($ttlSeconds)) {
+            return $this->delete($key);
         }
 
         $payload = serialize([
-            'expiresAt' => $expiresAt,
+            'key'       => $key,
+            'expiresAt' => $ttlSeconds === null ? null : time() + $ttlSeconds,
             'value'     => $value,
         ]);
 
@@ -129,14 +139,20 @@ final class FileDriver implements DriverInterface, PrunableDriverInterface
         return @unlink($path);
     }
 
-    public function clear(): bool
+    public function clear(string $namespace = ''): bool
     {
         if (!is_dir($this->directory)) {
             return true;
         }
 
+        $prefix = $namespace . CacheKey::SEPARATOR;
+
         $ok = true;
         foreach (glob($this->directory . '/*.cache') ?: [] as $file) {
+            if ($namespace !== '' && !$this->fileBelongsToNamespace($file, $prefix)) {
+                continue;
+            }
+
             $ok = @unlink($file) && $ok;
         }
 
@@ -220,7 +236,7 @@ final class FileDriver implements DriverInterface, PrunableDriverInterface
             }
 
             $expiresAt = $payload['expiresAt'];
-            if ($expiresAt !== null && (!is_int($expiresAt) || $expiresAt < $now)) {
+            if ($expiresAt !== null && (!is_int($expiresAt) || $expiresAt <= $now)) {
                 $result = $this->removePrunedFile($file, $result, 'expired');
                 continue;
             }
@@ -263,6 +279,25 @@ final class FileDriver implements DriverInterface, PrunableDriverInterface
     {
         // sha1 достаточно, т.к. это key->filename mapping, не криптография.
         return rtrim($this->directory, '/\\') . '/' . sha1($key) . '.cache';
+    }
+
+    /**
+     * Файл без ключа (формат до 1.0 или битый) считается принадлежащим любому namespace: это кеш, лишнее удаление
+     * безопаснее, чем пережившие clear() данные.
+     */
+    private function fileBelongsToNamespace(string $file, string $prefix): bool
+    {
+        $raw = @file_get_contents($file);
+        if ($raw === false) {
+            return false;
+        }
+
+        $payload = @unserialize($raw, ['allowed_classes' => false]);
+        if (!is_array($payload) || !isset($payload['key']) || !is_string($payload['key'])) {
+            return true;
+        }
+
+        return str_starts_with($payload['key'], $prefix);
     }
 
     private function removePrunedFile(string $file, CachePruneResult $result, string $reason): CachePruneResult

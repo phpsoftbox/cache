@@ -5,68 +5,65 @@ declare(strict_types=1);
 namespace PhpSoftBox\Cache;
 
 use DateInterval;
-use PhpSoftBox\Cache\Psr16\CacheItemPoolAdapter;
 use PhpSoftBox\Cache\Psr16\SimpleCache;
 use PhpSoftBox\Cache\Psr6\CacheItemPool;
 use PhpSoftBox\Cache\Support\CachePruneOptions;
 use PhpSoftBox\Cache\Support\CachePruneResult;
-use Psr\Cache\CacheItemPoolInterface;
 use Psr\SimpleCache\InvalidArgumentException;
-
-use function array_values;
-use function is_array;
-use function iterator_to_array;
 
 /**
  * Высокоуровневый объект "store".
  *
- * По умолчанию это PSR-16 API (get/set/etc.), а при необходимости можно получить PSR-6 pool.
+ * PSR-16 API (get/set/etc.) и PSR-6 pool поверх одного драйвера и одного namespace. Объект неизменяемый:
+ * withNamespace() возвращает новый store.
  */
-final class CacheStore
+final readonly class CacheStore
 {
-    private ?CacheItemPoolAdapter $poolAdapter = null;
-
-    private string $namespace = '';
-
     public function __construct(
-        private readonly SimpleCache $simple,
-        private readonly ?CacheItemPool $pool = null,
+        private SimpleCache $simple,
+        private CacheItemPool $pool,
     ) {
     }
 
+    /**
+     * Store с вложенным namespace: для стора с namespace `app` вызов `withNamespace('login')` даёт ключи
+     * `app:login:<key>`. clear() такого стора очищает только `app:login`.
+     */
     public function withNamespace(string $namespace): self
     {
-        $clone            = clone $this;
-        $clone->namespace = $namespace;
-
-        return $clone;
+        return new self(
+            simple: $this->simple->withNamespace($namespace),
+            pool: $this->pool->withNamespace($namespace),
+        );
     }
 
+    /**
+     * Полный namespace стора (сегменты через `:`), пустая строка — без namespace.
+     */
     public function namespace(): string
     {
-        return $this->namespace;
-    }
-
-    public function setNamespace(string $namespace): void
-    {
-        $this->namespace = $namespace;
+        return $this->simple->namespace();
     }
 
     public function get(string $key, mixed $default = null): mixed
     {
-        return $this->simple->get($this->prefixKey($key), $default);
+        return $this->simple->get($key, $default);
     }
 
     public function set(string $key, mixed $value, null|int|DateInterval $ttl = null): bool
     {
-        return $this->simple->set($this->prefixKey($key), $value, $ttl);
+        return $this->simple->set($key, $value, $ttl);
     }
 
     public function delete(string $key): bool
     {
-        return $this->simple->delete($this->prefixKey($key));
+        return $this->simple->delete($key);
     }
 
+    /**
+     * Очищает namespace стора (включая вложенные). Store без namespace очищает всё хранилище драйвера:
+     * для Redis — FLUSHDB, для Memcached — весь сервер.
+     */
     public function clear(): bool
     {
         return $this->simple->clear();
@@ -77,60 +74,27 @@ final class CacheStore
      */
     public function getMultiple(iterable $keys, mixed $default = null): iterable
     {
-        $prefixed = [];
-        foreach ($keys as $k) {
-            $k            = (string) $k;
-            $prefixed[$k] = $this->prefixKey($k);
-        }
-
-        $values = $this->simple->getMultiple(array_values($prefixed), $default);
-
-        $out       = [];
-        $valuesArr = is_array($values) ? $values : iterator_to_array($values);
-        foreach ($prefixed as $original => $real) {
-            $out[$original] = $valuesArr[$real] ?? $default;
-        }
-
-        return $out;
+        return $this->simple->getMultiple($keys, $default);
     }
 
     public function setMultiple(iterable $values, null|int|DateInterval $ttl = null): bool
     {
-        $mapped = [];
-        foreach ($values as $k => $v) {
-            $mapped[$this->prefixKey((string) $k)] = $v;
-        }
-
-        return $this->simple->setMultiple($mapped, $ttl);
+        return $this->simple->setMultiple($values, $ttl);
     }
 
     public function deleteMultiple(iterable $keys): bool
     {
-        $mapped = [];
-        foreach ($keys as $k) {
-            $mapped[] = $this->prefixKey((string) $k);
-        }
-
-        return $this->simple->deleteMultiple($mapped);
+        return $this->simple->deleteMultiple($keys);
     }
 
     public function has(string $key): bool
     {
-        return $this->simple->has($this->prefixKey($key));
+        return $this->simple->has($key);
     }
 
     public function prune(?CachePruneOptions $options = null): CachePruneResult
     {
         return $this->simple->prune($options);
-    }
-
-    private function prefixKey(string $key): string
-    {
-        if ($this->namespace == '') {
-            return $key;
-        }
-
-        return $this->namespace . '-' . $key;
     }
 
     /**
@@ -142,16 +106,10 @@ final class CacheStore
     }
 
     /**
-     * Явный доступ к PSR-6 для интеграций.
-     *
-     * Если store создан только как PSR-16, возвращается адаптер.
+     * Явный доступ к PSR-6 для интеграций (тот же драйвер и namespace, что у PSR-16).
      */
-    public function psr6(): CacheItemPoolInterface
+    public function psr6(): CacheItemPool
     {
-        if ($this->pool !== null) {
-            return $this->pool;
-        }
-
-        return $this->poolAdapter ??= new CacheItemPoolAdapter($this->simple);
+        return $this->pool;
     }
 }

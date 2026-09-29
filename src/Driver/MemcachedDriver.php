@@ -5,28 +5,52 @@ declare(strict_types=1);
 namespace PhpSoftBox\Cache\Driver;
 
 use DateInterval;
-use DateTimeImmutable;
 use Memcached;
 use PhpSoftBox\Cache\Contracts\DriverInterface;
 use PhpSoftBox\Cache\Contracts\PrunableDriverInterface;
 use PhpSoftBox\Cache\Exception\CacheException;
+use PhpSoftBox\Cache\Support\CacheKey;
 use PhpSoftBox\Cache\Support\CachePruneOptions;
 use PhpSoftBox\Cache\Support\CachePruneResult;
+use PhpSoftBox\Cache\Support\Ttl;
 
 use function array_key_exists;
+use function array_keys;
+use function array_pop;
+use function array_values;
+use function bin2hex;
+use function count;
+use function explode;
 use function extension_loaded;
-use function is_int;
+use function implode;
+use function is_array;
 use function is_string;
+use function random_bytes;
 use function serialize;
 use function strlen;
+use function time;
 use function unserialize;
 
 /**
  * Memcached driver (ext-memcached).
+ *
+ * Memcached не умеет удалять ключи по префиксу, поэтому namespace версионируется: у каждого уровня namespace
+ * (`app`, `app:login`) есть случайная версия, которая хранится в служебном ключе `@ns:<namespace>` и входит в
+ * реальный ключ (`app@<v1>:login@<v2>:key`). clear() с namespace меняет версию — старые записи становятся
+ * недоступны и вытесняются по TTL/LRU. clear() без namespace — flush() всего сервера.
+ *
+ * Цена версионирования: операция с ключом в namespace делает дополнительный запрос версий (один getMulti).
  */
 final class MemcachedDriver implements DriverInterface, PrunableDriverInterface
 {
     private const int MAX_KEY_LENGTH = 250;
+
+    /**
+     * TTL больше 30 дней Memcached трактует как абсолютный unix timestamp.
+     */
+    private const int MAX_RELATIVE_TTL = 2592000;
+
+    private const string VERSION_KEY_PREFIX = '@ns:';
 
     public static function isSupported(): bool
     {
@@ -43,9 +67,11 @@ final class MemcachedDriver implements DriverInterface, PrunableDriverInterface
 
     public function fetch(string $key): array
     {
-        $this->assertKeyLength($key);
-        $value = $this->memcached->get($key);
-        if ($this->memcached->getResultCode() === Memcached::RES_NOTFOUND) {
+        $realKey = $this->realKeys([$key])[$key];
+
+        $value = $this->memcached->get($realKey);
+        if ($this->memcached->getResultCode() !== Memcached::RES_SUCCESS) {
+            // RES_NOTFOUND, ошибка соединения и т.п. — промах
             return ['hit' => false, 'value' => null];
         }
 
@@ -61,50 +87,52 @@ final class MemcachedDriver implements DriverInterface, PrunableDriverInterface
 
     public function set(string $key, mixed $value, int|DateInterval|null $ttl = null): bool
     {
-        $this->assertKeyLength($key);
-        $ttlSeconds = $this->normalizeTtlSeconds($ttl);
-        $payload    = $this->serializeValue($value);
+        $ttlSeconds = Ttl::normalizeSeconds($ttl);
+        if (Ttl::isExpired($ttlSeconds)) {
+            return $this->delete($key);
+        }
 
-        return $this->memcached->set($key, $payload, $ttlSeconds ?? 0);
+        $realKey = $this->realKeys([$key])[$key];
+
+        return $this->memcached->set($realKey, $this->serializeValue($value), $this->expiration($ttlSeconds));
     }
 
     public function delete(string $key): bool
     {
-        $this->assertKeyLength($key);
-        $this->memcached->delete($key);
+        $realKey = $this->realKeys([$key])[$key];
+
+        $this->memcached->delete($realKey);
         $code = $this->memcached->getResultCode();
 
         return $code === Memcached::RES_SUCCESS || $code === Memcached::RES_NOTFOUND;
     }
 
-    public function clear(): bool
+    public function clear(string $namespace = ''): bool
     {
-        return $this->memcached->flush();
+        if ($namespace === '') {
+            return $this->memcached->flush();
+        }
+
+        return $this->memcached->set($this->versionKey($namespace), $this->newVersion(), 0);
     }
 
     public function fetchMultiple(iterable $keys): array
     {
-        $keysArr = [];
-        foreach ($keys as $k) {
-            $k = (string) $k;
-            $this->assertKeyLength($k);
-            $keysArr[] = $k;
-        }
-
-        if ($keysArr === []) {
+        $realKeys = $this->realKeys($this->keyList($keys));
+        if ($realKeys === []) {
             return [];
         }
 
-        $values = $this->memcached->getMulti($keysArr) ?: [];
+        $values = $this->memcached->getMulti(array_values($realKeys));
+        if (!is_array($values)) {
+            $values = [];
+        }
 
         $out = [];
-        foreach ($keysArr as $key) {
-            if (!array_key_exists($key, $values)) {
-                $out[$key] = ['hit' => false, 'value' => null];
-                continue;
-            }
-
-            $out[$key] = ['hit' => true, 'value' => $this->unserializeValue($values[$key])];
+        foreach ($realKeys as $key => $realKey) {
+            $out[$key] = array_key_exists($realKey, $values)
+                ? ['hit' => true, 'value' => $this->unserializeValue($values[$realKey])]
+                : ['hit' => false, 'value' => null];
         }
 
         return $out;
@@ -122,56 +150,179 @@ final class MemcachedDriver implements DriverInterface, PrunableDriverInterface
 
     public function setMultiple(iterable $values, int|DateInterval|null $ttl = null): bool
     {
-        $ttlSeconds = $this->normalizeTtlSeconds($ttl);
+        $ttlSeconds = Ttl::normalizeSeconds($ttl);
 
-        $payloads = [];
+        $items = [];
         foreach ($values as $k => $v) {
-            $k = (string) $k;
-            $this->assertKeyLength($k);
-            $payloads[$k] = $this->serializeValue($v);
+            $items[(string) $k] = $v;
         }
 
-        if ($payloads === []) {
+        if ($items === []) {
             return true;
         }
 
-        // ext-memcached: setMulti принимает ttl вторым аргументом
-        $ok = $this->memcached->setMulti($payloads, $ttlSeconds ?? 0);
+        if (Ttl::isExpired($ttlSeconds)) {
+            return $this->deleteMultiple(array_keys($items));
+        }
 
-        return (bool) $ok;
+        $realKeys = $this->realKeys(array_keys($items));
+
+        $payloads = [];
+        foreach ($items as $k => $v) {
+            $payloads[$realKeys[$k]] = $this->serializeValue($v);
+        }
+
+        return $this->memcached->setMulti($payloads, $this->expiration($ttlSeconds));
     }
 
     public function deleteMultiple(iterable $keys): bool
     {
-        $keysArr = [];
-        foreach ($keys as $k) {
-            $k = (string) $k;
-            $this->assertKeyLength($k);
-            $keysArr[] = $k;
-        }
-
-        if ($keysArr === []) {
+        $realKeys = $this->realKeys($this->keyList($keys));
+        if ($realKeys === []) {
             return true;
         }
 
-        // deleteMulti возвращает массив результатов, но на него нельзя полагаться как на bool
-        $this->memcached->deleteMulti($keysArr);
+        $results = $this->memcached->deleteMulti(array_values($realKeys));
+        if (!is_array($results)) {
+            return false;
+        }
+
+        foreach ($results as $result) {
+            // true — удалён, RES_NOTFOUND — ключа не было
+            if ($result !== true && $result !== Memcached::RES_NOTFOUND) {
+                return false;
+            }
+        }
 
         return true;
     }
 
     public function has(string $key): bool
     {
-        $this->assertKeyLength($key);
-        $this->memcached->get($key);
-
-        return $this->memcached->getResultCode() !== Memcached::RES_NOTFOUND;
+        return $this->fetch($key)['hit'];
     }
 
     public function prune(?CachePruneOptions $options = null): CachePruneResult
     {
         // Memcached удаляет TTL-записи самостоятельно; generic prune не сканирует keyspace.
         return CachePruneResult::empty();
+    }
+
+    /**
+     * Секунды TTL -> expiration для Memcached: до 30 дней — относительное значение, больше — абсолютный timestamp.
+     */
+    private function expiration(?int $ttlSeconds): int
+    {
+        if ($ttlSeconds === null) {
+            return 0;
+        }
+
+        return $ttlSeconds > self::MAX_RELATIVE_TTL ? time() + $ttlSeconds : $ttlSeconds;
+    }
+
+    /**
+     * Реальные ключи с версиями namespace. Версии всех уровней читаются одним getMulti.
+     *
+     * @param list<string> $keys
+     * @return array<string, string>
+     */
+    private function realKeys(array $keys): array
+    {
+        $parsed      = [];
+        $versionKeys = [];
+        foreach ($keys as $key) {
+            $segments = explode(CacheKey::SEPARATOR, $key);
+            $name     = array_pop($segments);
+
+            $namespaces = [];
+            $path       = [];
+            foreach ($segments as $segment) {
+                $path[]       = $segment;
+                $namespace    = implode(CacheKey::SEPARATOR, $path);
+                $namespaces[] = $namespace;
+
+                $versionKeys[$namespace] = $this->versionKey($namespace);
+            }
+
+            $parsed[$key] = ['segments' => $segments, 'namespaces' => $namespaces, 'name' => $name];
+        }
+
+        $versions = $versionKeys === [] ? [] : $this->versions($versionKeys);
+
+        $out = [];
+        foreach ($parsed as $key => $item) {
+            $parts = [];
+            foreach ($item['segments'] as $i => $segment) {
+                $parts[] = $segment . '@' . $versions[$item['namespaces'][$i]];
+            }
+
+            $parts[] = $item['name'];
+            $realKey = count($parts) === 1 ? (string) $key : implode(CacheKey::SEPARATOR, $parts);
+
+            $this->assertKeyLength($realKey);
+            $out[(string) $key] = $realKey;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param array<string, string> $versionKeys namespace => служебный ключ версии
+     * @return array<string, string> namespace => версия
+     */
+    private function versions(array $versionKeys): array
+    {
+        $stored = $this->memcached->getMulti(array_values($versionKeys));
+        if (!is_array($stored)) {
+            $stored = [];
+        }
+
+        $versions = [];
+        foreach ($versionKeys as $namespace => $versionKey) {
+            $version = $stored[$versionKey] ?? null;
+            if (!is_string($version)) {
+                // версии нет (первое обращение или вытеснена): add() не перетирает версию,
+                // которую успел записать параллельный процесс
+                $version = $this->newVersion();
+                if (!$this->memcached->add($versionKey, $version, 0)) {
+                    $existing = $this->memcached->get($versionKey);
+                    if ($this->memcached->getResultCode() === Memcached::RES_SUCCESS && is_string($existing)) {
+                        $version = $existing;
+                    }
+                }
+            }
+
+            $versions[$namespace] = $version;
+        }
+
+        return $versions;
+    }
+
+    private function versionKey(string $namespace): string
+    {
+        $versionKey = self::VERSION_KEY_PREFIX . $namespace;
+        $this->assertKeyLength($versionKey);
+
+        return $versionKey;
+    }
+
+    private function newVersion(): string
+    {
+        return bin2hex(random_bytes(4));
+    }
+
+    /**
+     * @param iterable<string> $keys
+     * @return list<string>
+     */
+    private function keyList(iterable $keys): array
+    {
+        $out = [];
+        foreach ($keys as $k) {
+            $out[] = (string) $k;
+        }
+
+        return $out;
     }
 
     private function assertKeyLength(string $key): void
@@ -193,22 +344,5 @@ final class MemcachedDriver implements DriverInterface, PrunableDriverInterface
         }
 
         return @unserialize($raw);
-    }
-
-    private function normalizeTtlSeconds(int|DateInterval|null $ttl): ?int
-    {
-        if ($ttl === null) {
-            return null;
-        }
-
-        if (is_int($ttl)) {
-            return $ttl;
-        }
-
-        $now = new DateTimeImmutable();
-
-        $dt = $now->add($ttl);
-
-        return $dt->getTimestamp() - $now->getTimestamp();
     }
 }

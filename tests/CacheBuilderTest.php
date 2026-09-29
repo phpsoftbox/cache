@@ -9,14 +9,18 @@ use PhpSoftBox\Cache\Configurator\BuiltInDriverFactory;
 use PhpSoftBox\Cache\Configurator\CacheBuilder;
 use PhpSoftBox\Cache\Configurator\CacheStoreFactory;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\CoversMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
 use function bin2hex;
+use function glob;
 use function random_bytes;
 use function sys_get_temp_dir;
 
 #[CoversClass(CacheBuilder::class)]
+#[CoversMethod(CacheBuilder::class, 'fromConfig')]
+#[CoversMethod(CacheBuilder::class, 'storeFactoryFromConfig')]
 final class CacheBuilderTest extends TestCase
 {
     /**
@@ -66,5 +70,36 @@ final class CacheBuilderTest extends TestCase
         $store = $factory->store('default');
         self::assertTrue($store->set('foo', 'bar'));
         self::assertSame('bar', $store->get('foo'));
+    }
+
+    /**
+     * Проверяет, что пример chain из документации собирается без DI и пишет во все уровни.
+     *
+     * @see CacheBuilder::fromConfig()
+     */
+    #[Test]
+    public function builderSupportsChainDriver(): void
+    {
+        $directory = sys_get_temp_dir() . '/phpsoftbox-cache-test-' . bin2hex(random_bytes(6));
+
+        $cache = CacheBuilder::fromConfig([
+            'default' => 'default',
+            'stores'  => [
+                'default' => [
+                    'driver'    => 'chain',
+                    'namespace' => 'app',
+                    'options'   => [
+                        'drivers' => [
+                            'array',
+                            ['driver' => 'file', 'options' => ['directory' => $directory]],
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        self::assertTrue($cache->set('foo', 'bar'));
+        self::assertSame('bar', $cache->get('foo'));
+        self::assertCount(1, glob($directory . '/*.cache') ?: []);
     }
 }
