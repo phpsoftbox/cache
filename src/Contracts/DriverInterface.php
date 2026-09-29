@@ -10,6 +10,9 @@ use DateInterval;
  * Низкоуровневый контракт драйвера кеша.
  *
  * Это внутренний интерфейс компонента, поверх которого строятся PSR-6 и PSR-16.
+ *
+ * TTL: `null` — без срока жизни, `<= 0` — запись не сохраняется, а существующая удаляется (PSR-16).
+ * Namespace приходит в драйвер частью ключа: `namespace:key` (сегменты namespace разделены `:`).
  */
 interface DriverInterface
 {
@@ -34,11 +37,21 @@ interface DriverInterface
      */
     public function get(string $key): mixed;
 
+    /**
+     * Сохраняет значение. TTL `<= 0` удаляет ключ.
+     */
     public function set(string $key, mixed $value, int|DateInterval|null $ttl = null): bool;
 
+    /**
+     * Удаляет ключ. Отсутствие ключа — не ошибка (true).
+     */
     public function delete(string $key): bool;
 
-    public function clear(): bool;
+    /**
+     * Очищает namespace: удаляет (или делает недоступными) все ключи вида `<namespace>:...`, включая вложенные
+     * namespace. Пустой namespace — очистка всего хранилища драйвера.
+     */
+    public function clear(string $namespace = ''): bool;
 
     /**
      * @param iterable<string> $keys

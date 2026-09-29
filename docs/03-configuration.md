@@ -21,10 +21,31 @@ $config = [
 
 ## Поля store
 
-- `driver` — строковый идентификатор драйвера (`array`, `file`, ...)
-- `namespace` — префикс ключей (будет добавлен как `namespace:key`)
+- `driver` — строковый идентификатор драйвера (`array`, `file`, `chain`, ...)
+- `namespace` — префикс ключей (будет добавлен как `namespace:key`); сегменты через `:`, без `{}()/\@`.
+  Ограничивает `clear()` этим namespace — задавайте его всегда, когда хранилище общее
 - `default_ttl` — TTL по умолчанию (секунды или `DateInterval`)
 - `options` — массив driver-specific опций
+
+`CacheBuilder` знает встроенные драйверы `array`, `file` и `chain`. Остальные подключаются вторым
+аргументом:
+
+```php
+$cache = CacheBuilder::fromConfig($config, [
+    new \PhpSoftBox\Cache\Configurator\RedisDriverFactory($redis),
+]);
+```
+
+## Очистка (`clear()`) по драйверам
+
+| Драйвер   | `clear()` стора с namespace                                    | `clear()` стора без namespace |
+|-----------|----------------------------------------------------------------|-------------------------------|
+| array     | удаляет ключи `namespace:*`                                     | всё хранилище процесса        |
+| file      | читает файлы каталога и удаляет файлы namespace                | все `*.cache` каталога        |
+| pdo       | `DELETE ... WHERE key LIKE 'namespace:%'`                      | вся таблица                   |
+| redis     | `SCAN MATCH namespace:*` + `UNLINK`, остальные ключи базы целы | `FLUSHDB` текущей базы        |
+| memcached | смена версии namespace (см. ниже)                              | `flush` всего сервера         |
+| chain     | `clear()` каждого уровня                                        | `clear()` каждого уровня      |
 
 ### Пример: file
 
@@ -40,16 +61,25 @@ $config = [
 
 Если не указать `options.directory`, драйвер по умолчанию создаст каталог
 `sys_get_temp_dir() . '/phpsoftbox-cache'`. Значения сериализуются через
-`serialize()`, каждый ключ хранится отдельным файлом `*.cache`, каталог
-создаётся автоматически при первой записи.
+`serialize()`, каждый ключ хранится отдельным файлом `*.cache` (внутри — ключ, срок жизни и значение),
+каталог создаётся автоматически. `clear()` с namespace читает все файлы каталога: для больших каталогов
+это медленная операция. Файлы старого формата (без ключа) при `clear()` с namespace удаляются.
 
 ## Драйвер: chain
 
 `chain` — это цепочка драйверов (L1 -> L2 -> L3 ...).
 
 - чтение идёт сверху вниз
-- при hit на нижнем уровне значение прогревает верхние уровни
-- запись идёт во все уровни
+- при hit на нижнем уровне значение прогревает верхние уровни **с оставшимся сроком жизни записи**;
+  если нижний уровень срок не сообщает (Memcached), — с `warmup_ttl`
+- запись, удаление и `clear()` идут во все уровни
+
+Опции:
+
+- `drivers` — непустой список уровней. Уровень — имя драйвера (`'array'`) или массив
+  `['driver' => 'file', 'options' => [...]]`, опции передаются вложенному драйверу. Вложенный `chain` не
+  поддерживается
+- `warmup_ttl` — TTL прогрева (сек), когда срок записи на нижнем уровне неизвестен; по умолчанию 60
 
 Пример (без DI):
 
@@ -61,35 +91,23 @@ $cache = \PhpSoftBox\Cache\Configurator\CacheBuilder::fromConfig([
       'driver' => 'chain',
       'namespace' => 'app',
       'options' => [
-        'stores' => ['array', 'file'],
+        'drivers' => [
+          'array', // L1
+          ['driver' => 'file', 'options' => ['directory' => __DIR__ . '/var/cache']], // L2
+        ],
+        'warmup_ttl' => 60,
       ],
     ],
   ],
 ]);
 ```
 
-Важно: в DI-режиме chain собирается через `ChainDriverFactory`, которому нужно передать список доступных `DriverFactoryInterface`.
+В DI-режиме chain собирается через `ChainDriverFactory`, которому передаётся список
+`DriverFactoryInterface` для уровней (например, `BuiltInDriverFactory` и `RedisDriverFactory`), а сам
+`ChainDriverFactory` добавляется в `driverFactories` фабрики сторов.
 
-Минимальный пример конфигурации (без DI) с двумя уровнями:
-
-```php
-$config = [
-  'default' => 'default',
-  'stores' => [
-    'default' => [
-      'driver' => 'chain',
-      'namespace' => 'app',
-      'options' => [
-        'stores' => ['array', 'file'], // L1, L2
-      ],
-    ],
-    'file' => [
-      'driver' => 'file',
-      'namespace' => 'app',
-    ],
-  ],
-];
-```
+Учтите: верхний уровень `array` — память процесса. Удаление и `clear()` в одном процессе не видны L1 других
+процессов, пока не истечёт срок прогретой записи.
 
 ## Драйвер: pdo
 
@@ -100,7 +118,8 @@ $config = [
 - `table` — имя таблицы
 - `driver` — тип SQL-движка (`sqlite`/`mysql`/`pgsql`) для корректного upsert/quoting
 - `key_column` — колонка primary key
-- `value_column` — колонка с данными (serialized)
+- `value_column` — колонка с данными: `base64(serialize(value))` в `TEXT` (безопасно для бинарных строк и
+  объектов с private/protected свойствами, в том числе на Postgres)
 - `expiration_datetime_column` — колонка с временем жизни (unix timestamp) или NULL
 - `created_datetime_column` — колонка с датой/временем создания
 - `auto_create_table` — автоматически создавать таблицу (по умолчанию `true`)
@@ -133,6 +152,8 @@ $driver = new \PhpSoftBox\Cache\Driver\PdoDriver(
 
 Важно: namespace в PDO драйвере **не нужен** — он применяется снаружи через `SimpleCache` и `CacheStore` (ключи уже приходят в драйвер с префиксом `namespace:key`).
 
+Записи, сохранённые версиями до 1.0 (`serialize()` без base64), читаются как промах и удаляются при чтении.
+
 ## Драйвер: redis
 
 `redis` — кеш через **ext-redis**.
@@ -162,9 +183,26 @@ $factory = new \PhpSoftBox\Cache\Configurator\CacheStoreFactory(
 );
 ```
 
+Особенности:
+
+- `clear()` стора с namespace удаляет только ключи `namespace:*` через `SCAN` + `UNLINK` (не блокирует
+  сервер, но проходит весь keyspace базы); сессии, очереди и rate-limit в той же базе не трогаются
+- `clear()` стора **без** namespace — `FLUSHDB` текущей базы
+- TTL `0`/отрицательный удаляет ключ; `setMultiple()` с TTL пишет ключи через `SETEX` в pipeline
+
 ## Драйвер: memcached
 
 `memcached` — кеш через **ext-memcached**.
+
+Особенности:
+
+- TTL больше 30 дней передаётся как абсолютный timestamp (`time() + ttl`), поэтому долгие TTL работают
+- hit — только при `RES_SUCCESS`: ошибка соединения — промах, а не `null`
+- Memcached не умеет удалять по префиксу, поэтому namespace **версионируется**: у каждого уровня namespace
+  есть случайная версия в служебном ключе `@ns:<namespace>`, реальный ключ — `app@<версия>:key`. `clear()`
+  с namespace меняет версию: старые записи становятся недоступны и вытесняются по TTL/LRU. Каждая операция с
+  ключом в namespace делает дополнительный запрос версий (один `getMulti`)
+- `clear()` стора **без** namespace — `flush` всего сервера
 
 Рекомендуемый подход — через DI:
 
@@ -190,6 +228,16 @@ $factory = new \PhpSoftBox\Cache\Configurator\CacheStoreFactory(
 );
 ```
 
+## Свои драйверы
+
+Драйвер реализует `PhpSoftBox\Cache\Contracts\DriverInterface`:
+
+- ключи приходят с namespace (`app:login:key`); `clear(string $namespace)` должен удалить (или сделать
+  недоступными) все ключи `namespace:*`, пустой namespace — всё хранилище
+- TTL `<= 0` в `set()`/`setMultiple()` удаляет ключи; удаление отсутствующего ключа возвращает `true`
+- опционально `PrunableDriverInterface` (команда `cache:prune`) и `ExpirationAwareDriverInterface`
+  (`fetchWithExpiration()` — срок жизни записи для точного прогрева в `chain`)
+
 ## Примечания
 
-Тесты скипаются, если нет расширений/сервисов.
+Тесты Redis/Memcached/MariaDB/Postgres пропускаются, если нет расширений/сервисов.

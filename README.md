@@ -9,7 +9,9 @@
 - основной сервис для DI: `PhpSoftBox\Cache\Cache`
 - несколько сторов (stores) по имени: `default`, `files`, `redis` и т.д.
 - расширяемые драйверы через `DriverFactoryInterface`
-- поддержка PSR-16 и PSR-6
+- поддержка PSR-16 и PSR-6 поверх одного драйвера стора
+- namespace стора и вложенные namespace; `clear()` очищает только свой namespace
+- контекстный namespace (например, изоляция арендаторов) через `Cache::setContextNamespace()`
 
 ## Установка и требования
 
@@ -43,6 +45,14 @@ $cache->store()->set('foo', 'bar', 30);
 ### Через DI
 
 См. пример для PHP-DI в документации: [docs/04-di.md](docs/04-di.md).
+
+## Важное о семантике
+
+- TTL `0` и отрицательный TTL (и `expiresAt` в прошлом для PSR-6) удаляют запись.
+- Ключи PSR-16 и PSR-6 не могут содержать `{}()/\@:`; `:` — разделитель namespace.
+- `clear()` стора с namespace очищает только этот namespace (и вложенные). Store **без** namespace
+  очищает всё хранилище драйвера: для Redis — `FLUSHDB` текущей базы, для Memcached — весь сервер.
+  Для Redis/Memcached всегда задавайте `namespace`. Подробнее: [docs/03-configuration.md](docs/03-configuration.md).
 
 ## CLI
 

@@ -7,6 +7,7 @@ namespace PhpSoftBox\Cache\Tests;
 use PhpSoftBox\Cache\Driver\FileDriver;
 use PhpSoftBox\Cache\Support\CachePruneOptions;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\CoversMethod;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
@@ -22,6 +23,10 @@ use function time;
 use function touch;
 
 #[CoversClass(FileDriver::class)]
+#[CoversMethod(FileDriver::class, 'set')]
+#[CoversMethod(FileDriver::class, 'fetch')]
+#[CoversMethod(FileDriver::class, 'clear')]
+#[CoversMethod(FileDriver::class, 'prune')]
 final class FileDriverTest extends TestCase
 {
     /**
@@ -100,5 +105,45 @@ final class FileDriverTest extends TestCase
         self::assertFalse(file_exists($invalidPath));
         self::assertFalse(file_exists($tmpPath));
         self::assertSame('keep', $d->get('valid'));
+    }
+
+    /**
+     * Проверяет, что TTL 0 удаляет существующую запись (PSR-16).
+     *
+     * @see FileDriver::set()
+     */
+    #[Test]
+    public function zeroTtlDeletesExistingKey(): void
+    {
+        $d = new FileDriver(sys_get_temp_dir() . '/phpsoftbox-cache-test-' . bin2hex(random_bytes(6)));
+
+        $d->set('a', 'v');
+
+        self::assertTrue($d->set('a', 'new', 0));
+
+        self::assertFalse($d->has('a'));
+    }
+
+    /**
+     * Проверяет, что clear() с namespace удаляет только файлы этого namespace (включая вложенные).
+     *
+     * @see FileDriver::clear()
+     */
+    #[Test]
+    public function clearWithNamespaceRemovesOnlyNamespaceKeys(): void
+    {
+        $d = new FileDriver(sys_get_temp_dir() . '/phpsoftbox-cache-test-' . bin2hex(random_bytes(6)));
+
+        $d->set('app:a', 1);
+        $d->set('app:sub:b', 2);
+        $d->set('apple:c', 3);
+        $d->set('plain', 4);
+
+        self::assertTrue($d->clear('app'));
+
+        self::assertFalse($d->has('app:a'));
+        self::assertFalse($d->has('app:sub:b'));
+        self::assertTrue($d->has('apple:c'));
+        self::assertTrue($d->has('plain'));
     }
 }

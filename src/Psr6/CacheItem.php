@@ -10,7 +10,6 @@ use DateTimeInterface;
 use Psr\Cache\CacheItemInterface;
 
 use function is_int;
-use function max;
 
 final class CacheItem implements CacheItemInterface
 {
@@ -70,7 +69,7 @@ final class CacheItem implements CacheItemInterface
         }
 
         if (is_int($time)) {
-            $this->expiresAt = new DateTimeImmutable()->getTimestamp() + max(0, $time);
+            $this->expiresAt = new DateTimeImmutable()->getTimestamp() + $time;
 
             return $this;
         }
